@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Ally Vera</string>
+    <string name="accessibility_service_description">Helps detect unsafe content for accountability purposes.</string>
+</resources>
