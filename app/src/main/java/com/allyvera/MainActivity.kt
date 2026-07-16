@@ -18,22 +18,39 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import com.allyvera.ui.debug.DebugScreen
 import com.allyvera.ui.theme.AllyVeraTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            AllyVeraTheme {   // Use the existing theme
-                AccessibilityScreen()
+            AllyVeraTheme {
+                val navController = rememberNavController()
+                NavHost(navController = navController, startDestination = "main") {
+                    composable("main") {
+                        AccessibilityScreen(
+                            onNavigateToDebug = { navController.navigate("debug") }
+                        )
+                    }
+                    composable("debug") {
+                        DebugScreen()
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-fun AccessibilityScreen() {
+fun AccessibilityScreen(
+    onNavigateToDebug: () -> Unit = {}
+) {
     val context = LocalContext.current
+
     Column(
         modifier = Modifier.fillMaxSize().padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -45,6 +62,10 @@ fun AccessibilityScreen() {
             context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }) {
             Text("Open Accessibility Settings")
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(onClick = onNavigateToDebug) {
+            Text("View Captured Screenshots")
         }
     }
 }

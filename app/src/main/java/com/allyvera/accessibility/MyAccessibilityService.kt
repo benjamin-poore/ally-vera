@@ -1,5 +1,6 @@
 package com.allyvera.accessibility
 
+import com.allyvera.ui.debug.DebugManager
 import android.accessibilityservice.AccessibilityService
 import android.graphics.Bitmap
 import android.hardware.HardwareBuffer
@@ -86,8 +87,9 @@ class MyAccessibilityService : AccessibilityService() {
             val bitmap = hardwareBuffer.toBitmap()
             hardwareBuffer.close() // free native memory
             if (bitmap != null) {
-                val savedPath = saveBitmap(bitmap)
-                Log.d(TAG, "Saved to $savedPath")
+                val savedFile = saveBitmap(bitmap)
+                DebugManager.addScreenshot(savedFile)
+                Log.d(TAG, "Saved to ${savedFile.absolutePath}")
             } else {
                 Log.e(TAG, "Failed to convert hardware buffer to bitmap")
             }
@@ -107,7 +109,7 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun saveBitmap(bitmap: Bitmap): String {
+    private fun saveBitmap(bitmap: Bitmap): File {
         val dir = File(filesDir, "screenshots")
         if (!dir.exists()) dir.mkdirs()
         val dateFormat = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
@@ -116,7 +118,7 @@ class MyAccessibilityService : AccessibilityService() {
         FileOutputStream(file).use { out ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
         }
-        return file.absolutePath
+        return file
     }
 
     companion object {
