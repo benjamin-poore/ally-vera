@@ -1,0 +1,247 @@
+package com.allyvera.screen
+
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.Image
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.allyvera.MainActivity
+import com.allyvera.screenshot.ScreenshotSaver
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+
+class ScreenCaptureService : Service() {
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var captureThread: HandlerThread? = null
+    private var imageReader: ImageReader? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var mediaProjection: MediaProjection? = null
+    private var nextCaptureAtMs = 0L
+    private var isStopping = false
+
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.i(TAG, "MediaProjection session stopped")
+            stopSelf()
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
+        val resultData = intent?.projectionResultData()
+
+        if (resultCode != Activity.RESULT_OK || resultData == null) {
+            Log.e(TAG, "Missing valid MediaProjection consent result")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        if (mediaProjection != null) {
+            Log.i(TAG, "Screen capture is already running")
+            return START_NOT_STICKY
+        }
+
+        try {
+            startAsForeground()
+            startProjection(resultCode, resultData)
+        } catch (exception: Exception) {
+            Log.e(TAG, "Unable to start screen capture", exception)
+            stopSelf(startId)
+        }
+
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        isStopping = true
+        imageReader?.setOnImageAvailableListener(null, null)
+        virtualDisplay?.release()
+        virtualDisplay = null
+        imageReader?.close()
+        imageReader = null
+        mediaProjection?.unregisterCallback(projectionCallback)
+        mediaProjection?.stop()
+        mediaProjection = null
+        captureThread?.quitSafely()
+        captureThread = null
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    private fun startAsForeground() {
+        createNotificationChannel()
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun startProjection(resultCode: Int, resultData: Intent) {
+        val projectionManager = getSystemService(MediaProjectionManager::class.java)
+        val projection = projectionManager.getMediaProjection(resultCode, resultData)
+            ?: error("MediaProjectionManager returned no projection")
+        mediaProjection = projection
+        projection.registerCallback(projectionCallback, mainHandler)
+
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val densityDpi = metrics.densityDpi
+
+        val thread = HandlerThread("ScreenCaptureFrames").also { it.start() }
+        captureThread = thread
+        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        imageReader = reader
+        reader.setOnImageAvailableListener(
+            { source -> onImageAvailable(source, width, height) },
+            Handler(thread.looper)
+        )
+
+        virtualDisplay = projection.createVirtualDisplay(
+            "AllyVeraScreenCapture",
+            width,
+            height,
+            densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            reader.surface,
+            null,
+            null
+        )
+    }
+
+    private fun onImageAvailable(reader: ImageReader, width: Int, height: Int) {
+        val image = reader.acquireLatestImage() ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (now < nextCaptureAtMs || isStopping) {
+            image.close()
+            return
+        }
+
+        nextCaptureAtMs = now + CAPTURE_INTERVAL_MS
+        serviceScope.launch {
+            try {
+                val bitmap = image.toBitmap(width, height)
+                try {
+                    ScreenshotSaver.save(this@ScreenCaptureService, bitmap)
+                } finally {
+                    bitmap.recycle()
+                }
+            } catch (exception: Exception) {
+                Log.e(TAG, "Unable to save MediaProjection screenshot", exception)
+            } finally {
+                image.close()
+            }
+        }
+    }
+
+    private fun Image.toBitmap(width: Int, height: Int): Bitmap {
+        val plane = planes.first()
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * width
+        val paddedWidth = width + rowPadding / pixelStride
+
+        val paddedBitmap = Bitmap.createBitmap(
+            paddedWidth,
+            height,
+            Bitmap.Config.ARGB_8888
+        )
+        plane.buffer.rewind()
+        paddedBitmap.copyPixelsFromBuffer(plane.buffer)
+        if (paddedWidth == width) return paddedBitmap
+
+        val croppedBitmap = Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
+        paddedBitmap.recycle()
+        return croppedBitmap
+    }
+
+    private fun createNotificationChannel() {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "Screen capture",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Required while legacy screen capture is active"
+            }
+        )
+    }
+
+    private fun buildNotification(): Notification {
+        val openAppIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setContentTitle("Screen capture active")
+            .setContentText("Ally Vera is capturing a screenshot every 15 seconds")
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun Intent.projectionResultData(): Intent? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+        } else {
+            getParcelableExtra(EXTRA_RESULT_DATA)
+        }
+
+    companion object {
+        private const val TAG = "ScreenCaptureService"
+        private const val NOTIFICATION_CHANNEL_ID = "screen_capture"
+        private const val NOTIFICATION_ID = 1001
+        private const val CAPTURE_INTERVAL_MS = 15_000L
+        private const val EXTRA_RESULT_CODE = "resultCode"
+        private const val EXTRA_RESULT_DATA = "resultData"
+
+        fun createStartIntent(
+            context: Context,
+            resultCode: Int,
+            resultData: Intent
+        ): Intent = Intent(context, ScreenCaptureService::class.java).apply {
+            putExtra(EXTRA_RESULT_CODE, resultCode)
+            putExtra(EXTRA_RESULT_DATA, resultData)
+        }
+    }
+}

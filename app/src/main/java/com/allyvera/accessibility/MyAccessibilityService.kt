@@ -1,6 +1,6 @@
 package com.allyvera.accessibility
 
-import com.allyvera.ui.debug.DebugManager
+import com.allyvera.screenshot.ScreenshotSaver
 import android.accessibilityservice.AccessibilityService
 import android.graphics.Bitmap
 import android.hardware.HardwareBuffer
@@ -10,13 +10,11 @@ import android.view.accessibility.AccessibilityEvent
 import androidx.annotation.RequiresApi
 import kotlinx.coroutines.*
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlin.coroutines.resume
-import java.io.File
-import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.allyvera.screen.MediaProjectionConsentActivity
+import kotlin.coroutines.resume
+
 class MyAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
@@ -30,7 +28,11 @@ class MyAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "Service connected")
-        startPeriodicScreenshots()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startPeriodicScreenshots()
+        } else {
+            startLegacyScreenCapture()
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -43,17 +45,22 @@ class MyAccessibilityService : AccessibilityService() {
         Log.d(TAG, "Service destroyed")
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun startPeriodicScreenshots() {
         screenshotJob?.cancel()
         screenshotJob = serviceScope.launch {
             while (isActive) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    takeScreenshotNow()
-                } else {
-                    Log.w(TAG, "Screenshots require API 34+")
-                }
+                takeScreenshotNow()
                 delay(15_000) // 15 seconds
             }
+        }
+    }
+
+    private fun startLegacyScreenCapture() {
+        try {
+            startActivity(MediaProjectionConsentActivity.createIntent(this))
+        } catch (exception: Exception) {
+            Log.e(TAG, "Unable to launch MediaProjection consent", exception)
         }
     }
 
@@ -89,42 +96,29 @@ class MyAccessibilityService : AccessibilityService() {
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private suspend fun processScreenshot(screenshotResult: ScreenshotResult) {
         val hardwareBuffer = screenshotResult.hardwareBuffer
-        if (hardwareBuffer != null) {
+        try {
             val bitmap = withContext(Dispatchers.Default) {
                 hardwareBuffer.toBitmap()
             }
-            hardwareBuffer.close()   // this is fine, HardwareBuffer has close()
             if (bitmap != null) {
-                val savedFile = saveBitmap(bitmap)
-                DebugManager.addScreenshot(savedFile)
+                val savedFile = ScreenshotSaver.save(this, bitmap)
                 Log.d(TAG, "Saved to ${savedFile.absolutePath}")
             }
-        } else {
-            Log.e(TAG, "HardwareBuffer is null")
+        } finally {
+            hardwareBuffer.close()
         }
     }
 
     /**
-     * Converts a HardwareBuffer to a Bitmap (available from API 26+).
+     * Converts a HardwareBuffer to a Bitmap.
      */
+    @RequiresApi(Build.VERSION_CODES.Q)
     private fun HardwareBuffer.toBitmap(): Bitmap? {
         return try {
             Bitmap.wrapHardwareBuffer(this, null)
         } catch (e: Exception) {
             null
         }
-    }
-
-    private suspend fun saveBitmap(bitmap: Bitmap): File = withContext(Dispatchers.IO) {
-        val dir = File(filesDir, "screenshots")
-        if (!dir.exists()) dir.mkdirs()
-        val dateFormat = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
-        val filename = "screenshot_${dateFormat.format(Date())}.jpg"
-        val file = File(dir, filename)
-        FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
-        }
-        file   // no return keyword
     }
 
     companion object {
