@@ -15,7 +15,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
-
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 class MyAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
@@ -60,14 +61,18 @@ class MyAccessibilityService : AccessibilityService() {
     private suspend fun takeScreenshotNow() = suspendCancellableCoroutine<Unit> { continuation ->
         try {
             takeScreenshot(
-                0,                     // displayId (primary)
-                mainExecutor,          // executor
+                0,
+                mainExecutor,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshotResult: ScreenshotResult) {
-                        processScreenshot(screenshotResult)
-                        continuation.resume(Unit)
+                        // Launch a coroutine to process (or use runBlocking if you prefer,
+                        // but since we're already inside a suspend function, we can just call
+                        // another suspend function directly after we resume the continuation)
+                        serviceScope.launch {
+                            processScreenshot(screenshotResult)
+                            continuation.resume(Unit)
+                        }
                     }
-
                     override fun onFailure(errorCode: Int) {
                         Log.e(TAG, "Screenshot failed with error code: $errorCode")
                         continuation.resume(Unit)
@@ -80,18 +85,19 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
+
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private fun processScreenshot(screenshotResult: ScreenshotResult) {
+    private suspend fun processScreenshot(screenshotResult: ScreenshotResult) {
         val hardwareBuffer = screenshotResult.hardwareBuffer
         if (hardwareBuffer != null) {
-            val bitmap = hardwareBuffer.toBitmap()
-            hardwareBuffer.close() // free native memory
+            val bitmap = withContext(Dispatchers.Default) {
+                hardwareBuffer.toBitmap()
+            }
+            hardwareBuffer.close()   // this is fine, HardwareBuffer has close()
             if (bitmap != null) {
                 val savedFile = saveBitmap(bitmap)
                 DebugManager.addScreenshot(savedFile)
                 Log.d(TAG, "Saved to ${savedFile.absolutePath}")
-            } else {
-                Log.e(TAG, "Failed to convert hardware buffer to bitmap")
             }
         } else {
             Log.e(TAG, "HardwareBuffer is null")
@@ -109,7 +115,7 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun saveBitmap(bitmap: Bitmap): File {
+    private suspend fun saveBitmap(bitmap: Bitmap): File = withContext(Dispatchers.IO) {
         val dir = File(filesDir, "screenshots")
         if (!dir.exists()) dir.mkdirs()
         val dateFormat = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
@@ -118,7 +124,7 @@ class MyAccessibilityService : AccessibilityService() {
         FileOutputStream(file).use { out ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
         }
-        return file
+        file   // no return keyword
     }
 
     companion object {
