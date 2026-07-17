@@ -9,9 +9,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
+import android.hardware.display.DisplayManager
+import android.view.Display
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
@@ -38,6 +40,7 @@ class ScreenCaptureService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var captureThread: HandlerThread? = null
+    private var captureHandler: Handler? = null
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaProjection: MediaProjection? = null
@@ -52,6 +55,13 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        captureHandler?.post {
+            updateCaptureDimensions()
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
@@ -91,6 +101,7 @@ class ScreenCaptureService : Service() {
         mediaProjection = null
         captureThread?.quitSafely()
         captureThread = null
+        captureHandler = null
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -116,25 +127,17 @@ class ScreenCaptureService : Service() {
         mediaProjection = projection
         projection.registerCallback(projectionCallback, mainHandler)
 
-        val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val densityDpi = metrics.densityDpi
-
         val thread = HandlerThread("ScreenCaptureFrames").also { it.start() }
         captureThread = thread
-        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        imageReader = reader
-        reader.setOnImageAvailableListener(
-            { source -> onImageAvailable(source, width, height) },
-            Handler(thread.looper)
-        )
+        captureHandler = Handler(thread.looper)
 
+        val metrics = resources.displayMetrics
+        val reader = createImageReader(metrics.widthPixels, metrics.heightPixels)
         virtualDisplay = projection.createVirtualDisplay(
             "AllyVeraScreenCapture",
-            width,
-            height,
-            densityDpi,
+            metrics.widthPixels,
+            metrics.heightPixels,
+            metrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface,
             null,
@@ -142,10 +145,36 @@ class ScreenCaptureService : Service() {
         )
     }
 
-    private fun onImageAvailable(reader: ImageReader, width: Int, height: Int) {
+    private fun createImageReader(width: Int, height: Int): ImageReader {
+        return ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2).also { reader ->
+            imageReader = reader
+            reader.setOnImageAvailableListener(
+                { source -> onImageAvailable(source) },
+                captureHandler
+            )
+        }
+    }
+
+    private fun updateCaptureDimensions() {
+        val display = virtualDisplay ?: return
+        val oldReader = imageReader ?: return
+        val metrics = resources.displayMetrics
+        if (oldReader.width == metrics.widthPixels && oldReader.height == metrics.heightPixels) {
+            return
+        }
+
+        val newReader = createImageReader(metrics.widthPixels, metrics.heightPixels)
+        display.resize(metrics.widthPixels, metrics.heightPixels, metrics.densityDpi)
+        display.surface = newReader.surface
+        oldReader.setOnImageAvailableListener(null, null)
+        oldReader.close()
+        Log.i(TAG, "Capture resized to ${metrics.widthPixels}x${metrics.heightPixels}")
+    }
+
+    private fun onImageAvailable(reader: ImageReader) {
         val image = reader.acquireLatestImage() ?: return
         val now = SystemClock.elapsedRealtime()
-        if (now < nextCaptureAtMs || isStopping) {
+        if (now < nextCaptureAtMs || isStopping || !isScreenInteractive()) {
             image.close()
             return
         }
@@ -153,7 +182,7 @@ class ScreenCaptureService : Service() {
         nextCaptureAtMs = now + CAPTURE_INTERVAL_MS
         serviceScope.launch {
             try {
-                val bitmap = image.toBitmap(width, height)
+                val bitmap = image.toBitmap(image.width, image.height)
                 try {
                     ScreenshotSaver.save(this@ScreenCaptureService, bitmap)
                 } finally {
@@ -165,6 +194,11 @@ class ScreenCaptureService : Service() {
                 image.close()
             }
         }
+    }
+
+    private fun isScreenInteractive(): Boolean {
+        val displayManager = getSystemService(DisplayManager::class.java)
+        return displayManager.displays.any { it.state == Display.STATE_ON }
     }
 
     private fun Image.toBitmap(width: Int, height: Int): Bitmap {
@@ -242,6 +276,10 @@ class ScreenCaptureService : Service() {
         ): Intent = Intent(context, ScreenCaptureService::class.java).apply {
             putExtra(EXTRA_RESULT_CODE, resultCode)
             putExtra(EXTRA_RESULT_DATA, resultData)
+        }
+
+        fun stop(context: Context) {
+            context.stopService(Intent(context, ScreenCaptureService::class.java))
         }
     }
 }

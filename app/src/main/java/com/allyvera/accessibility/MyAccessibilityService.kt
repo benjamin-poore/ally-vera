@@ -110,12 +110,16 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Converts a HardwareBuffer to a Bitmap.
+     * Converts a HardwareBuffer to a software Bitmap (ARGB_8888).
+     * HARDWARE configs cannot be read with getPixels() for TFLite prep.
      */
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun HardwareBuffer.toBitmap(): Bitmap? {
         return try {
-            Bitmap.wrapHardwareBuffer(this, null)
+            val hardware = Bitmap.wrapHardwareBuffer(this, null) ?: return null
+            val software = hardware.copy(Bitmap.Config.ARGB_8888, false)
+            hardware.recycle()
+            software
         } catch (e: Exception) {
             null
         }
