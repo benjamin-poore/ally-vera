@@ -183,7 +183,10 @@ class ScreenCaptureService : Service(), CaptureController {
                 val path = FrameCache.write(this@ScreenCaptureService, bitmap, FrameSource.MEDIA_PROJECTION)
                 bitmap.recycle()
                 if (path != null) {
-                    FrameBus.emit(CapturedFrame(path, FrameSource.MEDIA_PROJECTION))
+                    // If the bus is full the frame would otherwise leak on disk — discard it.
+                    if (!FrameBus.emit(CapturedFrame(path, FrameSource.MEDIA_PROJECTION))) {
+                        FrameCache.delete(path)
+                    }
                 }
             } catch (exception: Exception) {
                 Log.e(TAG, "Unable to acquire MediaProjection frame", exception)

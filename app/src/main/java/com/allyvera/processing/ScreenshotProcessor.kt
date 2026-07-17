@@ -11,6 +11,7 @@ import com.allyvera.frame.FrameCache
 import com.allyvera.ui.debug.DebugManager
 import com.allyvera.ui.debug.DebugScreenshotItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -46,8 +47,9 @@ object ScreenshotProcessor {
     private const val CPU_CURRENT_A = 0.5   // 500 mA
 
     private var interpreter: Interpreter? = null
-    private val initMutex = Mutex()
-    private val inferenceMutex = Mutex()
+    // Single mutex guards the interpreter reference AND all interpreter.run calls, so release()
+    // cannot close the interpreter while a frame is mid-inference.
+    private val interpreterMutex = Mutex()
 
     // ------------------------------------------------------------------
     // Interpreter lifecycle
@@ -55,7 +57,7 @@ object ScreenshotProcessor {
 
     private suspend fun getInterpreter(context: Context): Interpreter {
         interpreter?.let { return it }
-        return initMutex.withLock {
+        return interpreterMutex.withLock {
             interpreter ?: run {
                 val modelBuffer = loadModelFile(context)
                 val options = Interpreter.Options().apply { setNumThreads(4) }
@@ -79,54 +81,31 @@ object ScreenshotProcessor {
     }
 
     fun release() {
+        // Hold the mutex so we never close while a run() is in flight on another thread.
+        runBlockingRelease()
+    }
+
+    private suspend fun releaseSuspended() = interpreterMutex.withLock {
         interpreter?.close()
         interpreter = null
     }
 
-    // ------------------------------------------------------------------
-    // Public detection API (patch-based)
-    // ------------------------------------------------------------------
-
-    suspend fun detectNsfw(context: Context, bitmap: Bitmap): NsfwScores =
-        withContext(Dispatchers.Default) {
-            try {
-                val software = ensureSoftwareBitmap(bitmap)
-                val interp = getInterpreter(context)
-                runInferenceOnPatches(software, interp)
-            } catch (e: Exception) {
-                Log.e(TAG, "NSFW detection failed", e)
-                NsfwScores()
-            }
-        }
+    private fun runBlockingRelease() {
+        // release() may be called from a non-suspend context (service onDestroy). Since the
+        // coordinator's scope is being cancelled, no new runs will start; waiting on the lock
+        // here is safe and brief.
+        kotlinx.coroutines.runBlocking { releaseSuspended() }
+    }
 
     // ------------------------------------------------------------------
     // Core inference engine
     // ------------------------------------------------------------------
 
-    private suspend fun runInferenceOnPatches(bitmap: Bitmap, interp: Interpreter): NsfwScores =
-        withContext(Dispatchers.Default) {
-            val patches = createPatches(bitmap)
-            var best = NsfwScores()
-
-            for (patch in patches) {
-                val scores = inferSinglePatch(patch, interp)
-                best = NsfwScores(
-                    drawings = maxOf(best.drawings, scores.drawings),
-                    hentai = maxOf(best.hentai, scores.hentai),
-                    neutral = maxOf(best.neutral, scores.neutral),
-                    porn = maxOf(best.porn, scores.porn),
-                    sexy = maxOf(best.sexy, scores.sexy)
-                )
-                patch.recycle()
-            }
-            best
-        }
-
     private suspend fun inferSinglePatch(patch: Bitmap, interp: Interpreter): NsfwScores =
         withContext(Dispatchers.Default) {
             val input = bitmapToInput(patch)
             val output = Array(1) { FloatArray(NUM_CLASSES) }
-            inferenceMutex.withLock {
+            interpreterMutex.withLock {
                 interp.run(input, output)
             }
             val probs = probabilities(output[0])

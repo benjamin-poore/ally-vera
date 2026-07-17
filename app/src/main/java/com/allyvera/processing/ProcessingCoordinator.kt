@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The "brain". Owns the single capture cadence and commands whichever sensor is currently
@@ -27,11 +28,10 @@ object ProcessingCoordinator {
     private const val CAPTURE_INTERVAL_MS = 15_000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var started = false
+    private val started = AtomicBoolean(false)
 
     fun start(context: Context) {
-        if (started) return
-        started = true
+        if (started.compareAndSet(false, true).not()) return
 
         // Consumer: turn emitted frame paths into analysis.
         FrameBus.frames
@@ -65,6 +65,6 @@ object ProcessingCoordinator {
     fun stop() {
         scope.cancel()
         ScreenshotProcessor.release()
-        started = false
+        started.set(false)
     }
 }

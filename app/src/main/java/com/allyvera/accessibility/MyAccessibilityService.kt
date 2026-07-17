@@ -95,7 +95,10 @@ class MyAccessibilityService : AccessibilityService(), CaptureController {
                                 )
                                 bitmap.recycle()
                                 if (path != null) {
-                                    FrameBus.emit(CapturedFrame(path, FrameSource.ACCESSIBILITY))
+                                    // If the bus is full the frame would otherwise leak on disk.
+                                    if (!FrameBus.emit(CapturedFrame(path, FrameSource.ACCESSIBILITY))) {
+                                        FrameCache.delete(path)
+                                    }
                                 }
                                 continuation.resume(Unit)
                             }
