@@ -1,6 +1,6 @@
 package com.allyvera.ui.debug
 
-import com.allyvera.processing.NsfwScores
+import com.allyvera.processing.NsfwResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -11,11 +11,13 @@ import java.io.File
 data class DebugScreenshotItem(
     val name: String,
     val file: File,                 // full screenshot
-    val modelInputFile: File,       // letterboxed preview (224x224)
-    val scores: NsfwScores? = null,
-    val patchFiles: List<File> = emptyList(),
+    val modelInputFile: File,       // the letterboxed 224x224 whole-frame input
+    val scores: NsfwResult? = null,
+    val tiled: Boolean = false,
+    val wholeFrameNsfw: Float = 0f,
+    val tileFiles: List<File> = emptyList(),
+    val tileScores: List<Float> = emptyList(),
     val totalTimeMs: Double = 0.0,
-    val perPatchTimesMs: List<Double> = emptyList(),
     val estimatedBatteryMah: Double = 0.0
 )
 

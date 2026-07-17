@@ -16,7 +16,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.allyvera.processing.NsfwScores
+import com.allyvera.processing.NsfwClassification
+import com.allyvera.processing.NsfwResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -37,7 +38,7 @@ fun DebugScreen() {
                             Text(text = item.name, style = MaterialTheme.typography.titleSmall)
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Full screenshot + model input preview
+                            // Full screenshot + the real 224x224 model input
                             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text("Captured", style = MaterialTheme.typography.labelSmall)
@@ -52,31 +53,12 @@ fun DebugScreen() {
                                     ScreenshotThumbnail(
                                         filePath = item.modelInputFile.absolutePath,
                                         modifier = Modifier.size(140.dp),
-                                        contentScale = ContentScale.FillBounds
+                                        contentScale = ContentScale.Crop
                                     )
                                 }
                             }
 
-                            // Patches (scrollable row)
-                            if (item.patchFiles.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("Patches (${item.patchFiles.size})", style = MaterialTheme.typography.labelMedium)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                LazyRow(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    modifier = Modifier.fillMaxWidth().height(130.dp)
-                                ) {
-                                    items(item.patchFiles) { patchFile ->
-                                        ScreenshotThumbnail(
-                                            filePath = patchFile.absolutePath,
-                                            modifier = Modifier.size(120.dp),
-                                            contentScale = ContentScale.Crop
-                                        )
-                                    }
-                                }
-                            }
-
-                            // Performance stats (timing + battery)
+                            // Performance stats (timing + battery + two-stage)
                             Spacer(modifier = Modifier.height(8.dp))
                             Card(
                                 colors = CardDefaults.cardColors(
@@ -89,35 +71,55 @@ fun DebugScreen() {
                                         Text("Total: ", style = MaterialTheme.typography.bodySmall)
                                         Text("%.1f ms".format(item.totalTimeMs), style = MaterialTheme.typography.bodySmall)
                                         Spacer(modifier = Modifier.width(16.dp))
-                                        Text("Avg/patch: ", style = MaterialTheme.typography.bodySmall)
-                                        val avg = if (item.perPatchTimesMs.isNotEmpty()) item.perPatchTimesMs.average() else 0.0
-                                        Text("%.1f ms".format(avg), style = MaterialTheme.typography.bodySmall)
-                                        Spacer(modifier = Modifier.width(16.dp))
                                         Text("Battery: ", style = MaterialTheme.typography.bodySmall)
                                         Text("%.3f mAh".format(item.estimatedBatteryMah), style = MaterialTheme.typography.bodySmall)
                                     }
-                                    if (item.perPatchTimesMs.isNotEmpty()) {
-                                        Text(
-                                            text = "Per-patch (ms): ${item.perPatchTimesMs.joinToString(", ") { "%.1f".format(it) }}",
-                                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp)
-                                        )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = "Whole-frame NSFW: %.2f  |  Tiled: %s".format(item.wholeFrameNsfw, item.tiled),
+                                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp)
+                                    )
+                                }
+                            }
+
+                            // Tiles (only shown when stage-2 fired)
+                            if (item.tileFiles.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text("Tiles (2×2, max-aggregated)", style = MaterialTheme.typography.labelMedium)
+                                Spacer(modifier = Modifier.height(4.dp))
+                                LazyRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.fillMaxWidth().height(120.dp)
+                                ) {
+                                    items(item.tileFiles) { tileFile ->
+                                        val idx = item.tileFiles.indexOf(tileFile)
+                                        Column {
+                                            ScreenshotThumbnail(
+                                                filePath = tileFile.absolutePath,
+                                                modifier = Modifier.size(110.dp),
+                                                contentScale = ContentScale.Crop
+                                            )
+                                            Text(
+                                                "%.2f".format(item.tileScores.getOrElse(idx) { 0f }),
+                                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp)
+                                            )
+                                        }
                                     }
                                 }
                             }
 
-                            // ----- NSFW SCORES (with dominant category) -----
+                            // ----- NSFW RESULT -----
                             Spacer(modifier = Modifier.height(8.dp))
                             item.scores?.let { scores ->
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text("Dominant: ", style = MaterialTheme.typography.bodySmall)
+                                    Text("Verdict: ", style = MaterialTheme.typography.bodySmall)
                                     Text(
-                                        text = scores.dominantCategory,
+                                        text = scores.classification.name,
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = when (scores.dominantCategory) {
-                                            "hentai", "porn" -> Color.Red
-                                            "sexy" -> Color(0xFFFF9800) // orange
-                                            "neutral" -> Color(0xFF4CAF50) // green
-                                            else -> Color.Gray
+                                        color = when (scores.classification) {
+                                            NsfwClassification.NSFW -> Color.Red
+                                            NsfwClassification.QUESTIONABLE -> Color(0xFFFF9800) // orange
+                                            NsfwClassification.SAFE -> Color(0xFF4CAF50) // green
                                         }
                                     )
                                 }
@@ -133,13 +135,10 @@ fun DebugScreen() {
 }
 
 @Composable
-fun NsfwScoresView(scores: NsfwScores) {
+fun NsfwScoresView(scores: NsfwResult) {
     val items = listOf(
-        "drawings" to scores.drawings,
-        "hentai" to scores.hentai,
-        "neutral" to scores.neutral,
-        "porn" to scores.porn,
-        "sexy" to scores.sexy
+        "safe" to scores.safe,
+        "nsfw" to scores.nsfw
     )
 
     items.forEach { (label, score) ->
@@ -168,15 +167,19 @@ fun NsfwScoresView(scores: NsfwScores) {
         }
         Spacer(modifier = Modifier.height(2.dp))
     }
+
+    Spacer(modifier = Modifier.height(4.dp))
+    Text(
+        text = "isNsfw=${scores.isNsfw}",
+        style = MaterialTheme.typography.bodySmall
+    )
 }
 
 fun scoreColor(category: String, score: Float): Color {
-    return when {
-        category == "neutral" && score > 0.5f -> Color(0xFF4CAF50) // green for safe
-        category == "drawings" && score > 0.5f -> Color(0xFF2196F3) // blue for drawings
-        (category == "hentai" || category == "porn") && score > 0.3f -> Color(0xFFF44336) // red for NSFW
-        category == "sexy" && score > 0.3f -> Color(0xFFFF9800) // orange for sexy
-        else -> Color(0xFF9E9E9E) // gray default
+    return when (category) {
+        "safe" -> Color(0xFF4CAF50) // green for safe
+        "nsfw" -> if (score > 0.3f) Color(0xFFF44336) else Color(0xFF9E9E9E) // red when high
+        else -> Color(0xFF9E9E9E)
     }
 }
 

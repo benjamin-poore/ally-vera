@@ -45,10 +45,11 @@ object ProcessingCoordinator {
             .launchIn(scope)
 
         // Clock: command the active sensor on a fixed cadence.
+        val appContext = context.applicationContext
         scope.launch {
             while (isActive) {
                 val controller = SensorRegistry.activeController
-                if (controller != null) {
+                if (controller != null && DeviceCaptureGate.canCapture(appContext)) {
                     try {
                         controller.capture()
                     } catch (exception: Exception) {

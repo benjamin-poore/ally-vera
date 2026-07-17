@@ -20,40 +20,32 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.math.exp
-import kotlin.math.min
 
 /**
- * Analysis layer. Owns the TFLite interpreter and the per-frame work: saving the full
- * screenshot, building the letterboxed preview, tiling + saving patches, running inference,
- * collecting timing/battery stats, and publishing a [DebugScreenshotItem] to [DebugManager].
+ * Analysis layer. Runs Yahoo OpenNSFW on the whole screen AND on 4 quadrant slices, taking the
+ * MAX nsfw across all 5 — maximizing coverage/recall (a sidebar ad or footer banner gets its own
+ * slice). At a 15s capture cadence the ~5 inferences are negligible (~60ms/frame).
  *
- * This is the only layer that touches the model and debug bookkeeping. Sensors never call it
- * directly — frames arrive through the [com.allyvera.frame.FrameBus] via the coordinator.
+ * Model: Yahoo OpenNSFW (binary safe/nsfw). Input is always 224x224, BGR, mean-subtracted
+ * [104,117,123]. Whole-frame is letterboxed (aspect-preserving, no distortion); each quadrant is
+ * scaled to 224x224.
  */
 object ScreenshotProcessor {
 
     private const val TAG = "ScreenshotProcessor"
     private const val SCREENSHOT_DIR = "screenshots"
     private const val MODEL_SIZE = 224
-    private const val MODEL_FILENAME = "nsfw_mobilenetv2.tflite"
-    private const val NUM_CLASSES = 5
+    private const val MODEL_FILENAME = "nsfw2.tflite"
+    private const val NUM_CLASSES = 2   // [safe, nsfw]
 
-    // Grid size: 2x2 = 4 patches
-    private const val GRID_COLS = 2
-    private const val GRID_ROWS = 2
+    private const val MEAN_B = 104f
+    private const val MEAN_G = 117f
+    private const val MEAN_R = 123f
 
-    // Estimated CPU current draw (amperes) for battery drain estimate
-    private const val CPU_CURRENT_A = 0.5   // 500 mA
+    private const val CPU_CURRENT_A = 0.5   // 500 mA estimate for battery drain
 
     private var interpreter: Interpreter? = null
-    // Single mutex guards the interpreter reference AND all interpreter.run calls, so release()
-    // cannot close the interpreter while a frame is mid-inference.
     private val interpreterMutex = Mutex()
-
-    // ------------------------------------------------------------------
-    // Interpreter lifecycle
-    // ------------------------------------------------------------------
 
     private suspend fun getInterpreter(context: Context): Interpreter {
         interpreter?.let { return it }
@@ -63,7 +55,7 @@ object ScreenshotProcessor {
                 val options = Interpreter.Options().apply { setNumThreads(4) }
                 Interpreter(modelBuffer, options).also {
                     interpreter = it
-                    Log.i(TAG, "TFLite interpreter loaded (CPU)")
+                    Log.i(TAG, "TFLite interpreter loaded (CPU): $MODEL_FILENAME")
                 }
             }
         }
@@ -80,10 +72,7 @@ object ScreenshotProcessor {
         }
     }
 
-    fun release() {
-        // Hold the mutex so we never close while a run() is in flight on another thread.
-        runBlockingRelease()
-    }
+    fun release() = runBlockingRelease()
 
     private suspend fun releaseSuspended() = interpreterMutex.withLock {
         interpreter?.close()
@@ -91,95 +80,73 @@ object ScreenshotProcessor {
     }
 
     private fun runBlockingRelease() {
-        // release() may be called from a non-suspend context (service onDestroy). Since the
-        // coordinator's scope is being cancelled, no new runs will start; waiting on the lock
-        // here is safe and brief.
         kotlinx.coroutines.runBlocking { releaseSuspended() }
     }
 
-    // ------------------------------------------------------------------
-    // Core inference engine
-    // ------------------------------------------------------------------
-
-    private suspend fun inferSinglePatch(patch: Bitmap, interp: Interpreter): NsfwScores =
+    /** Run a single bitmap through the model; returns the raw NSFW score (0..1). */
+    private suspend fun inferScore(modelInput: Bitmap, interp: Interpreter): Float =
         withContext(Dispatchers.Default) {
-            val input = bitmapToInput(patch)
+            val input = bitmapToInput(modelInput)
             val output = Array(1) { FloatArray(NUM_CLASSES) }
-            interpreterMutex.withLock {
-                interp.run(input, output)
-            }
-            val probs = probabilities(output[0])
-            NsfwScores(
-                drawings = probs[0],
-                hentai = probs[1],
-                neutral = probs[2],
-                porn = probs[3],
-                sexy = probs[4]
-            )
+            interpreterMutex.withLock { interp.run(input, output) }
+            output[0][1]   // [safe, nsfw] -> nsfw
         }
 
     // ------------------------------------------------------------------
-    // Patch creation (grid tiling)
+    // Preprocessing
     // ------------------------------------------------------------------
 
-    private fun createPatches(bitmap: Bitmap): List<Bitmap> {
-        val patches = mutableListOf<Bitmap>()
-        val cellWidth = bitmap.width / GRID_COLS
-        val cellHeight = bitmap.height / GRID_ROWS
+    /** Letterbox the whole screenshot into a 224x224 square (aspect-preserving, no distortion). */
+    private fun preprocessWhole(bitmap: Bitmap): Bitmap {
+        val (w, h) = bitmap.width to bitmap.height
+        val scale = MODEL_SIZE.toFloat() / maxOf(w, h)
+        val tw = (w * scale).toInt().coerceAtLeast(1)
+        val th = (h * scale).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(bitmap, tw, th, true)
+        val square = Bitmap.createBitmap(MODEL_SIZE, MODEL_SIZE, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(square)
+        canvas.drawColor(Color.BLACK)
+        canvas.drawBitmap(scaled, (MODEL_SIZE - tw) / 2f, (MODEL_SIZE - th) / 2f, null)
+        scaled.recycle()
+        return square
+    }
 
-        for (row in 0 until GRID_ROWS) {
-            for (col in 0 until GRID_COLS) {
-                val x = col * cellWidth
-                val y = row * cellHeight
-                val cropped = Bitmap.createBitmap(bitmap, x, y, cellWidth, cellHeight)
-                val scaled = Bitmap.createScaledBitmap(cropped, MODEL_SIZE, MODEL_SIZE, true)
-                cropped.recycle()
-                patches.add(scaled)
-            }
+    /** 4 equal quadrants of the SCREEN, each scaled to 224x224 (true spatial coverage). */
+    private fun preprocessQuadrants(bitmap: Bitmap): List<Bitmap> {
+        val halfW = bitmap.width / 2
+        val halfH = bitmap.height / 2
+        val quads = listOf(
+            Quad(0, 0, halfW, halfH),
+            Quad(halfW, 0, bitmap.width - halfW, halfH),
+            Quad(0, halfH, halfW, bitmap.height - halfH),
+            Quad(halfW, halfH, bitmap.width - halfW, bitmap.height - halfH)
+        )
+        return quads.map { (x, y, w, h) ->
+            val patch = Bitmap.createBitmap(bitmap, x, y, w, h)
+            val scaled = Bitmap.createScaledBitmap(patch, MODEL_SIZE, MODEL_SIZE, true)
+            patch.recycle()
+            scaled
         }
-        return patches
     }
 
-    // ------------------------------------------------------------------
-    // Letterboxed preview (for debugging, NOT used for inference)
-    // ------------------------------------------------------------------
-
-    private fun createLetterboxedPreview(bitmap: Bitmap): Bitmap {
-        val targetSize = MODEL_SIZE
-        val result = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(result)
-        canvas.drawColor(Color.BLACK)   // black padding – you can change to average color if needed
-
-        val scaleX = targetSize.toFloat() / bitmap.width
-        val scaleY = targetSize.toFloat() / bitmap.height
-        val scale = min(scaleX, scaleY)
-
-        val scaledWidth = (bitmap.width * scale).toInt()
-        val scaledHeight = (bitmap.height * scale).toInt()
-        val left = (targetSize - scaledWidth) / 2
-        val top = (targetSize - scaledHeight) / 2
-
-        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, scaledWidth, scaledHeight, true)
-        canvas.drawBitmap(scaledBitmap, left.toFloat(), top.toFloat(), null)
-        scaledBitmap.recycle()
-        return result
-    }
+    private data class Quad(val x: Int, val y: Int, val w: Int, val h: Int)
 
     // ------------------------------------------------------------------
-    // Bitmap preprocessing helpers
+    // Input tensor: BGR + mean subtract [104,117,123]
     // ------------------------------------------------------------------
 
     private fun bitmapToInput(bitmap: Bitmap): ByteBuffer {
         val buffer = ByteBuffer.allocateDirect(MODEL_SIZE * MODEL_SIZE * 3 * 4)
         buffer.order(ByteOrder.nativeOrder())
-
         val pixels = IntArray(MODEL_SIZE * MODEL_SIZE)
         bitmap.getPixels(pixels, 0, MODEL_SIZE, 0, 0, MODEL_SIZE, MODEL_SIZE)
-
         for (pixel in pixels) {
-            buffer.putFloat(((pixel shr 16) and 0xFF) / 255f)
-            buffer.putFloat(((pixel shr 8) and 0xFF) / 255f)
-            buffer.putFloat((pixel and 0xFF) / 255f)
+            val r = (pixel shr 16) and 0xFF
+            val g = (pixel shr 8) and 0xFF
+            val b = pixel and 0xFF
+            buffer.putFloat((b - MEAN_B))
+            buffer.putFloat((g - MEAN_G))
+            buffer.putFloat((r - MEAN_R))
         }
         buffer.rewind()
         return buffer
@@ -192,32 +159,7 @@ object ScreenshotProcessor {
     }
 
     // ------------------------------------------------------------------
-    // Probability post‑processing
-    // ------------------------------------------------------------------
-
-    private fun probabilities(output: FloatArray): FloatArray {
-        val sum = output.sum()
-        val alreadyProbabilities = output.all { it.isFinite() && it in 0f..1f } &&
-                sum in 0.98f..1.02f
-        if (alreadyProbabilities) {
-            return FloatArray(output.size) { index -> output[index] / sum }
-        }
-
-        val max = output.maxOrNull() ?: 0f
-        var exponentSum = 0.0
-        val exps = DoubleArray(output.size)
-        for (i in output.indices) {
-            exps[i] = exp((output[i] - max).toDouble())
-            exponentSum += exps[i]
-        }
-        return FloatArray(output.size) { i -> (exps[i] / exponentSum).toFloat() }
-    }
-
-    // ------------------------------------------------------------------
-    // Main processing (runs inference ONCE and logs timing)
-    //
-    // Consumes a cached frame file written by a sensor. Takes ownership of the cache file and
-    // deletes it once processing is complete (success or failure) so nothing is left behind.
+    // Main processing
     // ------------------------------------------------------------------
 
     suspend fun process(context: Context, framePath: String) {
@@ -228,11 +170,9 @@ object ScreenshotProcessor {
                 FrameCache.delete(framePath)
                 return@withContext
             }
-
             try {
                 processBitmap(context, bitmap)
             } finally {
-                // Always reclaim the sensor's cache file once we're done with it.
                 FrameCache.delete(framePath)
             }
         }
@@ -241,92 +181,70 @@ object ScreenshotProcessor {
     private suspend fun processBitmap(context: Context, bitmap: Bitmap) {
         val dir = File(context.filesDir, SCREENSHOT_DIR)
         if (!dir.exists()) dir.mkdirs()
-
         val timestamp = System.currentTimeMillis()
         val filename = "screenshot_$timestamp.jpg"
         val file = File(dir, filename)
         val modelInputFile = File(dir, "model_input_$timestamp.jpg")
-
-        // Folder for patches
-        val patchDir = File(dir, "patches_$timestamp")
-        if (!patchDir.exists()) patchDir.mkdirs()
+        val tileDir = File(dir, "tiles_$timestamp")
+        if (!tileDir.exists()) tileDir.mkdirs()
 
         val software = ensureSoftwareBitmap(bitmap)
 
-        // 1. Save full-resolution screenshot
-        FileOutputStream(file).use { out ->
-            software.compress(Bitmap.CompressFormat.JPEG, 80, out)
-        }
+        // Save full-resolution screenshot
+        FileOutputStream(file).use { out -> software.compress(Bitmap.CompressFormat.JPEG, 80, out) }
 
-        // 2. Save letterboxed preview
-        val preview = createLetterboxedPreview(software)
-        FileOutputStream(modelInputFile).use { out ->
-            preview.compress(Bitmap.CompressFormat.JPEG, 95, out)
-        }
-        preview.recycle()
+        // Whole-frame (letterboxed) input, saved for debug
+        val whole = preprocessWhole(software)
+        FileOutputStream(modelInputFile).use { out -> whole.compress(Bitmap.CompressFormat.JPEG, 95, out) }
 
-        // 3. Prepare patches and run inference
-        val patches = createPatches(software)
         val interp = getInterpreter(context)
-
-        var best = NsfwScores()
         val totalStartNanos = SystemClock.elapsedRealtimeNanos()
-        val patchDurationsMs = mutableListOf<Double>()
-        val patchFiles = mutableListOf<File>()
 
-        for ((index, patch) in patches.withIndex()) {
-            // 3a. Save this patch for debugging
-            val patchFile = File(patchDir, "patch_${index}_${patch.width}x${patch.height}.jpg")
-            FileOutputStream(patchFile).use { out ->
-                patch.compress(Bitmap.CompressFormat.JPEG, 95, out)
-            }
-            patchFiles.add(patchFile)
-
-            // 3b. Run inference with timing
-            val patchStartNanos = SystemClock.elapsedRealtimeNanos()
-            val scores = inferSinglePatch(patch, interp)
-            val patchDurationNanos = SystemClock.elapsedRealtimeNanos() - patchStartNanos
-            val patchDurationMs = patchDurationNanos / 1_000_000.0
-            patchDurationsMs.add(patchDurationMs)
-
-            // Aggregate (max per class)
-            best = NsfwScores(
-                drawings = maxOf(best.drawings, scores.drawings),
-                hentai = maxOf(best.hentai, scores.hentai),
-                neutral = maxOf(best.neutral, scores.neutral),
-                porn = maxOf(best.porn, scores.porn),
-                sexy = maxOf(best.sexy, scores.sexy)
-            )
-
-            patch.recycle()
+        // Always run whole-frame + 4 quadrants, take the max across all 5.
+        val wholeNsfw = inferScore(whole, interp)
+        val quadrants = preprocessQuadrants(software)
+        val tileFiles = mutableListOf<File>()
+        val tileScores = mutableListOf<Float>()
+        var finalNsfw = wholeNsfw
+        quadrants.forEachIndexed { index, quad ->
+            val tileFile = File(tileDir, "tile_$index.jpg")
+            FileOutputStream(tileFile).use { out -> quad.compress(Bitmap.CompressFormat.JPEG, 95, out) }
+            tileFiles.add(tileFile)
+            val s = inferScore(quad, interp)
+            tileScores.add(s)
+            finalNsfw = maxOf(finalNsfw, s)
+            quad.recycle()
         }
 
         val totalDurationNanos = SystemClock.elapsedRealtimeNanos() - totalStartNanos
         val totalDurationMs = totalDurationNanos / 1_000_000.0
         val estimatedBatteryMah = (CPU_CURRENT_A * totalDurationMs) / 3600.0
+        val result = NsfwResult(nsfw = finalNsfw)
 
         Log.i(TAG, "🔬 Inference stats for $filename")
-        Log.i(TAG, "   Patches: ${patches.size}")
-        Log.i(TAG, "   Per-patch times (ms): ${patchDurationsMs.joinToString(", ", "[", "]") { "%.1f".format(it) }}")
+        Log.i(TAG, "   Source: ${software.width}x${software.height} -> whole(letterbox) + 4 quadrants, max-aggregate")
+        Log.i(TAG, "   Whole=%.3f  Quads=%s".format(wholeNsfw, tileScores.joinToString(", ") { "%.3f".format(it) }))
+        Log.i(TAG, "   Final NSFW=%.3f  Safe=%.3f  (%s)".format(result.nsfw, result.safe, result.classification))
         Log.i(TAG, "   Total time: %.1f ms".format(totalDurationMs))
         Log.i(TAG, "   Estimated battery drain: ~%.3f mAh".format(estimatedBatteryMah))
-        Log.i(TAG, "   Scores: $best")
 
-        // Clean up
+        whole.recycle()
         if (software !== bitmap) software.recycle()
         bitmap.recycle()
 
-        // 4. Build debug item and pass to DebugManager
-        val debugItem = DebugScreenshotItem(
-            name = filename,
-            file = file,
-            modelInputFile = modelInputFile,
-            scores = best,
-            patchFiles = patchFiles,
-            totalTimeMs = totalDurationMs,
-            perPatchTimesMs = patchDurationsMs,
-            estimatedBatteryMah = estimatedBatteryMah
+        DebugManager.addScreenshot(
+            DebugScreenshotItem(
+                name = filename,
+                file = file,
+                modelInputFile = modelInputFile,
+                scores = result,
+                tiled = true,
+                wholeFrameNsfw = wholeNsfw,
+                tileFiles = tileFiles,
+                tileScores = tileScores,
+                totalTimeMs = totalDurationMs,
+                estimatedBatteryMah = estimatedBatteryMah
+            )
         )
-        DebugManager.addScreenshot(debugItem)
     }
 }

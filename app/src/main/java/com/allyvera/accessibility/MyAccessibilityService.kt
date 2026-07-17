@@ -13,6 +13,7 @@ import com.allyvera.frame.FrameBus
 import com.allyvera.frame.FrameCache
 import com.allyvera.frame.FrameSource
 import com.allyvera.frame.SensorRegistry
+import com.allyvera.processing.DeviceCaptureGate
 import com.allyvera.screen.MediaProjectionConsentActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -78,6 +79,10 @@ class MyAccessibilityService : AccessibilityService(), CaptureController {
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private suspend fun captureFrame() = suspendCancellableCoroutine<Unit> { continuation ->
+        if (!DeviceCaptureGate.canCapture(this)) {
+            continuation.resume(Unit)
+            return@suspendCancellableCoroutine
+        }
         try {
             takeScreenshot(
                 0,

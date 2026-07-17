@@ -11,7 +11,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.hardware.display.DisplayManager
-import android.view.Display
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.VirtualDisplay
@@ -33,6 +32,7 @@ import com.allyvera.frame.FrameBus
 import com.allyvera.frame.FrameCache
 import com.allyvera.frame.FrameSource
 import com.allyvera.frame.SensorRegistry
+import com.allyvera.processing.DeviceCaptureGate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -174,9 +174,12 @@ class ScreenCaptureService : Service(), CaptureController {
     override val source: FrameSource = FrameSource.MEDIA_PROJECTION
 
     override suspend fun capture() {
-        if (isStopping || !isScreenInteractive()) return
+        if (isStopping) return
         val reader = imageReader ?: return
         withContext(Dispatchers.IO) {
+            // Re-check lock/screen state on the same thread as acquisition. MediaProjection can
+            // still deliver frames after lock/screen-off, and a coordinator check can race.
+            if (!DeviceCaptureGate.canCapture(this@ScreenCaptureService)) return@withContext
             val image = reader.acquireLatestImage() ?: return@withContext
             try {
                 val bitmap = image.toBitmap(image.width, image.height)
@@ -194,11 +197,6 @@ class ScreenCaptureService : Service(), CaptureController {
                 image.close()
             }
         }
-    }
-
-    private fun isScreenInteractive(): Boolean {
-        val displayManager = getSystemService(DisplayManager::class.java)
-        return displayManager.displays.any { it.state == Display.STATE_ON }
     }
 
     private fun Image.toBitmap(width: Int, height: Int): Bitmap {
