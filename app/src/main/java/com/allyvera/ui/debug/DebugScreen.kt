@@ -16,7 +16,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.allyvera.screenshot.NsfwScores
+import com.allyvera.processing.NsfwScores
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 

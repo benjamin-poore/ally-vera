@@ -1,5 +1,4 @@
-package com.allyvera.screenshot
-
+package com.allyvera.processing
 
 data class NsfwScores(
     val drawings: Float = 0f,
@@ -9,7 +8,7 @@ data class NsfwScores(
     val sexy: Float = 0f
 ) {
     val maxScore: Float get() = listOf(drawings, hentai, neutral, porn, sexy).maxOrNull() ?: 0f
-    val dominantCategory: String get() = when(maxScore) {
+    val dominantCategory: String get() = when (maxScore) {
         drawings -> "drawings"
         hentai -> "hentai"
         neutral -> "neutral"

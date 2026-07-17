@@ -24,27 +24,26 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.allyvera.MainActivity
-import com.allyvera.screenshot.ScreenshotSaver
-import kotlinx.coroutines.CoroutineScope
+import com.allyvera.frame.CapturedFrame
+import com.allyvera.frame.CaptureController
+import com.allyvera.frame.FrameBus
+import com.allyvera.frame.FrameCache
+import com.allyvera.frame.FrameSource
+import com.allyvera.frame.SensorRegistry
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-class ScreenCaptureService : Service() {
+class ScreenCaptureService : Service(), CaptureController {
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var captureThread: HandlerThread? = null
     private var captureHandler: Handler? = null
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaProjection: MediaProjection? = null
-    private var nextCaptureAtMs = 0L
     private var isStopping = false
 
     private val projectionCallback = object : MediaProjection.Callback() {
@@ -81,6 +80,7 @@ class ScreenCaptureService : Service() {
         try {
             startAsForeground()
             startProjection(resultCode, resultData)
+            SensorRegistry.register(this)
         } catch (exception: Exception) {
             Log.e(TAG, "Unable to start screen capture", exception)
             stopSelf(startId)
@@ -90,6 +90,7 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
+        SensorRegistry.unregister(this)
         isStopping = true
         imageReader?.setOnImageAvailableListener(null, null)
         virtualDisplay?.release()
@@ -102,7 +103,6 @@ class ScreenCaptureService : Service() {
         captureThread?.quitSafely()
         captureThread = null
         captureHandler = null
-        serviceScope.cancel()
         super.onDestroy()
     }
 
@@ -148,10 +148,6 @@ class ScreenCaptureService : Service() {
     private fun createImageReader(width: Int, height: Int): ImageReader {
         return ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2).also { reader ->
             imageReader = reader
-            reader.setOnImageAvailableListener(
-                { source -> onImageAvailable(source) },
-                captureHandler
-            )
         }
     }
 
@@ -171,25 +167,26 @@ class ScreenCaptureService : Service() {
         Log.i(TAG, "Capture resized to ${metrics.widthPixels}x${metrics.heightPixels}")
     }
 
-    private fun onImageAvailable(reader: ImageReader) {
-        val image = reader.acquireLatestImage() ?: return
-        val now = SystemClock.elapsedRealtime()
-        if (now < nextCaptureAtMs || isStopping || !isScreenInteractive()) {
-            image.close()
-            return
-        }
+    /**
+     * Commanded by the coordinator. Pulls the most recent buffered frame, caches it to a file,
+     * and emits the path. The sensor decides nothing about cadence — it just does the work.
+     */
+    override val source: FrameSource = FrameSource.MEDIA_PROJECTION
 
-        nextCaptureAtMs = now + CAPTURE_INTERVAL_MS
-        serviceScope.launch {
+    override suspend fun capture() {
+        if (isStopping || !isScreenInteractive()) return
+        val reader = imageReader ?: return
+        withContext(Dispatchers.IO) {
+            val image = reader.acquireLatestImage() ?: return@withContext
             try {
                 val bitmap = image.toBitmap(image.width, image.height)
-                try {
-                    ScreenshotSaver.save(this@ScreenCaptureService, bitmap)
-                } finally {
-                    bitmap.recycle()
+                val path = FrameCache.write(this@ScreenCaptureService, bitmap, FrameSource.MEDIA_PROJECTION)
+                bitmap.recycle()
+                if (path != null) {
+                    FrameBus.emit(CapturedFrame(path, FrameSource.MEDIA_PROJECTION))
                 }
             } catch (exception: Exception) {
-                Log.e(TAG, "Unable to save MediaProjection screenshot", exception)
+                Log.e(TAG, "Unable to acquire MediaProjection frame", exception)
             } finally {
                 image.close()
             }
@@ -265,7 +262,6 @@ class ScreenCaptureService : Service() {
         private const val TAG = "ScreenCaptureService"
         private const val NOTIFICATION_CHANNEL_ID = "screen_capture"
         private const val NOTIFICATION_ID = 1001
-        private const val CAPTURE_INTERVAL_MS = 15_000L
         private const val EXTRA_RESULT_CODE = "resultCode"
         private const val EXTRA_RESULT_DATA = "resultData"
 

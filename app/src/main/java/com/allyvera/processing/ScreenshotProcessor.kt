@@ -1,11 +1,13 @@
-package com.allyvera.screenshot
+package com.allyvera.processing
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.os.SystemClock
 import android.util.Log
+import com.allyvera.frame.FrameCache
 import com.allyvera.ui.debug.DebugManager
 import com.allyvera.ui.debug.DebugScreenshotItem
 import kotlinx.coroutines.Dispatchers
@@ -17,15 +19,20 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import kotlin.math.exp
 import kotlin.math.min
 
-object ScreenshotSaver {
+/**
+ * Analysis layer. Owns the TFLite interpreter and the per-frame work: saving the full
+ * screenshot, building the letterboxed preview, tiling + saving patches, running inference,
+ * collecting timing/battery stats, and publishing a [DebugScreenshotItem] to [DebugManager].
+ *
+ * This is the only layer that touches the model and debug bookkeeping. Sensors never call it
+ * directly — frames arrive through the [com.allyvera.frame.FrameBus] via the coordinator.
+ */
+object ScreenshotProcessor {
 
-    private const val TAG = "ScreenshotSaver"
+    private const val TAG = "ScreenshotProcessor"
     private const val SCREENSHOT_DIR = "screenshots"
     private const val MODEL_SIZE = 224
     private const val MODEL_FILENAME = "nsfw_mobilenetv2.tflite"
@@ -228,100 +235,119 @@ object ScreenshotSaver {
     }
 
     // ------------------------------------------------------------------
-    // Main save function (runs inference ONCE and logs timing)
+    // Main processing (runs inference ONCE and logs timing)
+    //
+    // Consumes a cached frame file written by a sensor. Takes ownership of the cache file and
+    // deletes it once processing is complete (success or failure) so nothing is left behind.
     // ------------------------------------------------------------------
 
-    suspend fun save(context: Context, bitmap: Bitmap): File =
+    suspend fun process(context: Context, framePath: String) {
         withContext(Dispatchers.IO) {
-            val dir = File(context.filesDir, SCREENSHOT_DIR)
-            if (!dir.exists()) dir.mkdirs()
-
-            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            val filename = "screenshot_$timestamp.jpg"
-            val file = File(dir, filename)
-            val modelInputFile = File(dir, "model_input_$timestamp.jpg")
-
-            // Folder for patches
-            val patchDir = File(dir, "patches_$timestamp")
-            if (!patchDir.exists()) patchDir.mkdirs()
-
-            val software = ensureSoftwareBitmap(bitmap)
-
-            // 1. Save full-resolution screenshot
-            FileOutputStream(file).use { out ->
-                software.compress(Bitmap.CompressFormat.JPEG, 80, out)
+            val bitmap = BitmapFactory.decodeFile(framePath)
+            if (bitmap == null) {
+                Log.e(TAG, "Unable to decode cached frame $framePath")
+                FrameCache.delete(framePath)
+                return@withContext
             }
 
-            // 2. Save letterboxed preview
-            val preview = createLetterboxedPreview(software)
-            FileOutputStream(modelInputFile).use { out ->
-                preview.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            try {
+                processBitmap(context, bitmap)
+            } finally {
+                // Always reclaim the sensor's cache file once we're done with it.
+                FrameCache.delete(framePath)
             }
-            preview.recycle()
-
-            // 3. Prepare patches and run inference
-            val patches = createPatches(software)
-            val interp = getInterpreter(context)
-
-            var best = NsfwScores()
-            val totalStartNanos = SystemClock.elapsedRealtimeNanos()
-            val patchDurationsMs = mutableListOf<Double>()
-            val patchFiles = mutableListOf<File>()
-
-            for ((index, patch) in patches.withIndex()) {
-                // 3a. Save this patch for debugging
-                val patchFile = File(patchDir, "patch_${index}_${patch.width}x${patch.height}.jpg")
-                FileOutputStream(patchFile).use { out ->
-                    patch.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-                patchFiles.add(patchFile)
-
-                // 3b. Run inference with timing
-                val patchStartNanos = SystemClock.elapsedRealtimeNanos()
-                val scores = inferSinglePatch(patch, interp)
-                val patchDurationNanos = SystemClock.elapsedRealtimeNanos() - patchStartNanos
-                val patchDurationMs = patchDurationNanos / 1_000_000.0
-                patchDurationsMs.add(patchDurationMs)
-
-                // Aggregate (max per class)
-                best = NsfwScores(
-                    drawings = maxOf(best.drawings, scores.drawings),
-                    hentai = maxOf(best.hentai, scores.hentai),
-                    neutral = maxOf(best.neutral, scores.neutral),
-                    porn = maxOf(best.porn, scores.porn),
-                    sexy = maxOf(best.sexy, scores.sexy)
-                )
-
-                patch.recycle()
-            }
-
-            val totalDurationNanos = SystemClock.elapsedRealtimeNanos() - totalStartNanos
-            val totalDurationMs = totalDurationNanos / 1_000_000.0
-            val estimatedBatteryMah = (CPU_CURRENT_A * totalDurationMs) / 3600.0
-
-            Log.i(TAG, "🔬 Inference stats for $filename")
-            Log.i(TAG, "   Patches: ${patches.size}")
-            Log.i(TAG, "   Per-patch times (ms): ${patchDurationsMs.joinToString(", ", "[", "]") { "%.1f".format(it) }}")
-            Log.i(TAG, "   Total time: %.1f ms".format(totalDurationMs))
-            Log.i(TAG, "   Estimated battery drain: ~%.3f mAh".format(estimatedBatteryMah))
-            Log.i(TAG, "   Scores: $best")
-
-            // Clean up
-            if (software !== bitmap) software.recycle()
-
-            // 4. Build debug item and pass to DebugManager
-            val debugItem = DebugScreenshotItem(
-                name = filename,
-                file = file,
-                modelInputFile = modelInputFile,
-                scores = best,
-                patchFiles = patchFiles,
-                totalTimeMs = totalDurationMs,
-                perPatchTimesMs = patchDurationsMs,
-                estimatedBatteryMah = estimatedBatteryMah
-            )
-            DebugManager.addScreenshot(debugItem)
-
-            file
         }
+    }
+
+    private suspend fun processBitmap(context: Context, bitmap: Bitmap) {
+        val dir = File(context.filesDir, SCREENSHOT_DIR)
+        if (!dir.exists()) dir.mkdirs()
+
+        val timestamp = System.currentTimeMillis()
+        val filename = "screenshot_$timestamp.jpg"
+        val file = File(dir, filename)
+        val modelInputFile = File(dir, "model_input_$timestamp.jpg")
+
+        // Folder for patches
+        val patchDir = File(dir, "patches_$timestamp")
+        if (!patchDir.exists()) patchDir.mkdirs()
+
+        val software = ensureSoftwareBitmap(bitmap)
+
+        // 1. Save full-resolution screenshot
+        FileOutputStream(file).use { out ->
+            software.compress(Bitmap.CompressFormat.JPEG, 80, out)
+        }
+
+        // 2. Save letterboxed preview
+        val preview = createLetterboxedPreview(software)
+        FileOutputStream(modelInputFile).use { out ->
+            preview.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        }
+        preview.recycle()
+
+        // 3. Prepare patches and run inference
+        val patches = createPatches(software)
+        val interp = getInterpreter(context)
+
+        var best = NsfwScores()
+        val totalStartNanos = SystemClock.elapsedRealtimeNanos()
+        val patchDurationsMs = mutableListOf<Double>()
+        val patchFiles = mutableListOf<File>()
+
+        for ((index, patch) in patches.withIndex()) {
+            // 3a. Save this patch for debugging
+            val patchFile = File(patchDir, "patch_${index}_${patch.width}x${patch.height}.jpg")
+            FileOutputStream(patchFile).use { out ->
+                patch.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }
+            patchFiles.add(patchFile)
+
+            // 3b. Run inference with timing
+            val patchStartNanos = SystemClock.elapsedRealtimeNanos()
+            val scores = inferSinglePatch(patch, interp)
+            val patchDurationNanos = SystemClock.elapsedRealtimeNanos() - patchStartNanos
+            val patchDurationMs = patchDurationNanos / 1_000_000.0
+            patchDurationsMs.add(patchDurationMs)
+
+            // Aggregate (max per class)
+            best = NsfwScores(
+                drawings = maxOf(best.drawings, scores.drawings),
+                hentai = maxOf(best.hentai, scores.hentai),
+                neutral = maxOf(best.neutral, scores.neutral),
+                porn = maxOf(best.porn, scores.porn),
+                sexy = maxOf(best.sexy, scores.sexy)
+            )
+
+            patch.recycle()
+        }
+
+        val totalDurationNanos = SystemClock.elapsedRealtimeNanos() - totalStartNanos
+        val totalDurationMs = totalDurationNanos / 1_000_000.0
+        val estimatedBatteryMah = (CPU_CURRENT_A * totalDurationMs) / 3600.0
+
+        Log.i(TAG, "🔬 Inference stats for $filename")
+        Log.i(TAG, "   Patches: ${patches.size}")
+        Log.i(TAG, "   Per-patch times (ms): ${patchDurationsMs.joinToString(", ", "[", "]") { "%.1f".format(it) }}")
+        Log.i(TAG, "   Total time: %.1f ms".format(totalDurationMs))
+        Log.i(TAG, "   Estimated battery drain: ~%.3f mAh".format(estimatedBatteryMah))
+        Log.i(TAG, "   Scores: $best")
+
+        // Clean up
+        if (software !== bitmap) software.recycle()
+        bitmap.recycle()
+
+        // 4. Build debug item and pass to DebugManager
+        val debugItem = DebugScreenshotItem(
+            name = filename,
+            file = file,
+            modelInputFile = modelInputFile,
+            scores = best,
+            patchFiles = patchFiles,
+            totalTimeMs = totalDurationMs,
+            perPatchTimesMs = patchDurationsMs,
+            estimatedBatteryMah = estimatedBatteryMah
+        )
+        DebugManager.addScreenshot(debugItem)
+    }
 }

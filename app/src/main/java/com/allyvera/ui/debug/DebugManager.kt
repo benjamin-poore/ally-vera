@@ -1,6 +1,6 @@
 package com.allyvera.ui.debug
 
-import com.allyvera.screenshot.NsfwScores
+import com.allyvera.processing.NsfwScores
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow

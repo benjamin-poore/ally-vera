@@ -1,6 +1,5 @@
 package com.allyvera.accessibility
 
-import com.allyvera.screenshot.ScreenshotSaver
 import android.accessibilityservice.AccessibilityService
 import android.graphics.Bitmap
 import android.hardware.HardwareBuffer
@@ -8,17 +7,31 @@ import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import androidx.annotation.RequiresApi
-import kotlinx.coroutines.*
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import com.allyvera.frame.CapturedFrame
+import com.allyvera.frame.CaptureController
+import com.allyvera.frame.FrameBus
+import com.allyvera.frame.FrameCache
+import com.allyvera.frame.FrameSource
+import com.allyvera.frame.SensorRegistry
 import com.allyvera.screen.MediaProjectionConsentActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
-class MyAccessibilityService : AccessibilityService() {
+/**
+ * Dumb sensor. It does not own a clock and never decides when to capture — the coordinator
+ * commands [capture] on a fixed cadence. On command it snapshots the screen, caches the bitmap
+ * to a file, and emits only the path. All decisions about the data live in the processing layer.
+ */
+class MyAccessibilityService : AccessibilityService(), CaptureController {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
-    private var screenshotJob: Job? = null
+
+    override val source: FrameSource = FrameSource.ACCESSIBILITY
 
     override fun onCreate() {
         super.onCreate()
@@ -29,7 +42,7 @@ class MyAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         Log.d(TAG, "Service connected")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startPeriodicScreenshots()
+            SensorRegistry.register(this)
         } else {
             startLegacyScreenCapture()
         }
@@ -41,19 +54,14 @@ class MyAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        SensorRegistry.unregister(this)
         serviceScope.cancel()
         Log.d(TAG, "Service destroyed")
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private fun startPeriodicScreenshots() {
-        screenshotJob?.cancel()
-        screenshotJob = serviceScope.launch {
-            while (isActive) {
-                takeScreenshotNow()
-                delay(15_000) // 15 seconds
-            }
-        }
+    override suspend fun capture() {
+        captureFrame()
     }
 
     private fun startLegacyScreenCapture() {
@@ -64,22 +72,38 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Sensor work only: acquire a frame, persist it to cache, and emit the path. The bitmap is
+     * recycled once it has been written — the processing layer reads from disk.
+     */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private suspend fun takeScreenshotNow() = suspendCancellableCoroutine<Unit> { continuation ->
+    private suspend fun captureFrame() = suspendCancellableCoroutine<Unit> { continuation ->
         try {
             takeScreenshot(
                 0,
                 mainExecutor,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshotResult: ScreenshotResult) {
-                        // Launch a coroutine to process (or use runBlocking if you prefer,
-                        // but since we're already inside a suspend function, we can just call
-                        // another suspend function directly after we resume the continuation)
-                        serviceScope.launch {
-                            processScreenshot(screenshotResult)
+                        val bitmap = screenshotResult.hardwareBuffer.toBitmap()
+                        screenshotResult.hardwareBuffer.close()
+                        if (bitmap != null) {
+                            serviceScope.launch(Dispatchers.IO) {
+                                val path = FrameCache.write(
+                                    this@MyAccessibilityService,
+                                    bitmap,
+                                    FrameSource.ACCESSIBILITY
+                                )
+                                bitmap.recycle()
+                                if (path != null) {
+                                    FrameBus.emit(CapturedFrame(path, FrameSource.ACCESSIBILITY))
+                                }
+                                continuation.resume(Unit)
+                            }
+                        } else {
                             continuation.resume(Unit)
                         }
                     }
+
                     override fun onFailure(errorCode: Int) {
                         Log.e(TAG, "Screenshot failed with error code: $errorCode")
                         continuation.resume(Unit)
@@ -92,26 +116,9 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-
-    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private suspend fun processScreenshot(screenshotResult: ScreenshotResult) {
-        val hardwareBuffer = screenshotResult.hardwareBuffer
-        try {
-            val bitmap = withContext(Dispatchers.Default) {
-                hardwareBuffer.toBitmap()
-            }
-            if (bitmap != null) {
-                val savedFile = ScreenshotSaver.save(this, bitmap)
-                Log.d(TAG, "Saved to ${savedFile.absolutePath}")
-            }
-        } finally {
-            hardwareBuffer.close()
-        }
-    }
-
     /**
-     * Converts a HardwareBuffer to a software Bitmap (ARGB_8888).
-     * HARDWARE configs cannot be read with getPixels() for TFLite prep.
+     * Converts a HardwareBuffer to a software Bitmap (ARGB_8888). HARDWARE configs cannot be
+     * read with getPixels() for TFLite prep, so the processing layer expects a software bitmap.
      */
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun HardwareBuffer.toBitmap(): Bitmap? {
