@@ -16,7 +16,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.allyvera.processing.NsfwClassification
+import com.allyvera.processing.ClassScores
+import com.allyvera.processing.ContentSeverity
 import com.allyvera.processing.NsfwResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -28,106 +29,20 @@ fun DebugScreen() {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("Captured Screenshots (${screenshots.size})", style = MaterialTheme.typography.headlineSmall)
         Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Classifier: Int8 (model_dynamic_range.tflite) on CPU/XNNPack",
+            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
         if (screenshots.isEmpty()) {
             Text("No screenshots captured yet.")
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(screenshots) { item ->
-                    Card {
-                        Column(modifier = Modifier.padding(12.dp)) {
-                            Text(text = item.name, style = MaterialTheme.typography.titleSmall)
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            // Full screenshot + the real 224x224 model input
-                            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("Captured", style = MaterialTheme.typography.labelSmall)
-                                    ScreenshotThumbnail(
-                                        filePath = item.file.absolutePath,
-                                        modifier = Modifier.fillMaxWidth().height(140.dp),
-                                        contentScale = ContentScale.Fit
-                                    )
-                                }
-                                Column {
-                                    Text("AI input (224×224)", style = MaterialTheme.typography.labelSmall)
-                                    ScreenshotThumbnail(
-                                        filePath = item.modelInputFile.absolutePath,
-                                        modifier = Modifier.size(140.dp),
-                                        contentScale = ContentScale.Crop
-                                    )
-                                }
-                            }
-
-                            // Performance stats (timing + battery + two-stage)
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Card(
-                                colors = CardDefaults.cardColors(
-                                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                                )
-                            ) {
-                                Column(modifier = Modifier.padding(8.dp)) {
-                                    Text("Performance", style = MaterialTheme.typography.labelMedium)
-                                    Row {
-                                        Text("Total: ", style = MaterialTheme.typography.bodySmall)
-                                        Text("%.1f ms".format(item.totalTimeMs), style = MaterialTheme.typography.bodySmall)
-                                        Spacer(modifier = Modifier.width(16.dp))
-                                        Text("Battery: ", style = MaterialTheme.typography.bodySmall)
-                                        Text("%.3f mAh".format(item.estimatedBatteryMah), style = MaterialTheme.typography.bodySmall)
-                                    }
-                                    Spacer(modifier = Modifier.height(2.dp))
-                                    Text(
-                                        text = "Whole-frame NSFW: %.2f  |  Tiled: %s".format(item.wholeFrameNsfw, item.tiled),
-                                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp)
-                                    )
-                                }
-                            }
-
-                            // Tiles (only shown when stage-2 fired)
-                            if (item.tileFiles.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("Tiles (2×2, max-aggregated)", style = MaterialTheme.typography.labelMedium)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                LazyRow(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    modifier = Modifier.fillMaxWidth().height(120.dp)
-                                ) {
-                                    items(item.tileFiles) { tileFile ->
-                                        val idx = item.tileFiles.indexOf(tileFile)
-                                        Column {
-                                            ScreenshotThumbnail(
-                                                filePath = tileFile.absolutePath,
-                                                modifier = Modifier.size(110.dp),
-                                                contentScale = ContentScale.Crop
-                                            )
-                                            Text(
-                                                "%.2f".format(item.tileScores.getOrElse(idx) { 0f }),
-                                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            // ----- NSFW RESULT -----
-                            Spacer(modifier = Modifier.height(8.dp))
-                            item.scores?.let { scores ->
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text("Verdict: ", style = MaterialTheme.typography.bodySmall)
-                                    Text(
-                                        text = scores.classification.name,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = when (scores.classification) {
-                                            NsfwClassification.NSFW -> Color.Red
-                                            NsfwClassification.QUESTIONABLE -> Color(0xFFFF9800) // orange
-                                            NsfwClassification.SAFE -> Color(0xFF4CAF50) // green
-                                        }
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                NsfwScoresView(scores)
-                            } ?: Text("No NSFW scores", style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
+                    ScreenshotCard(item)
                 }
             }
         }
@@ -135,52 +50,184 @@ fun DebugScreen() {
 }
 
 @Composable
-fun NsfwScoresView(scores: NsfwResult) {
-    val items = listOf(
-        "safe" to scores.safe,
-        "nsfw" to scores.nsfw
-    )
+private fun ScreenshotCard(item: DebugScreenshotItem) {
+    Card {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(text = item.name, style = MaterialTheme.typography.titleSmall)
+            if (item.modelName.isNotEmpty()) {
+                Text(
+                    text = buildString {
+                        append("Model: ${item.modelName}")
+                        if (item.accelerator.isNotEmpty()) append("  ·  ${item.accelerator}")
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
 
-    items.forEach { (label, score) ->
+            Text("Captured", style = MaterialTheme.typography.labelSmall)
+            ScreenshotThumbnail(
+                filePath = item.file.absolutePath,
+                modifier = Modifier.fillMaxWidth().height(120.dp),
+                contentScale = ContentScale.Fit
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                )
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    Text("Performance", style = MaterialTheme.typography.labelMedium)
+                    Row {
+                        Text("Total: ", style = MaterialTheme.typography.bodySmall)
+                        Text("%.1f ms".format(item.totalTimeMs), style = MaterialTheme.typography.bodySmall)
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Text("Battery: ", style = MaterialTheme.typography.bodySmall)
+                        Text("%.3f mAh".format(item.estimatedBatteryMah), style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (item.views.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = item.views.joinToString("  |  ") {
+                                "%s %.0fms".format(it.label, it.timeMs)
+                            },
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp)
+                        )
+                    }
+                }
+            }
+
+            if (item.views.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Views (full + center square + strips)",
+                    style = MaterialTheme.typography.labelMedium
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    items(item.views) { view ->
+                        ViewResultColumn(view)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            item.scores?.let { scores ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Aggregate verdict: ", style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        text = scores.classification.name,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = severityColor(scores.classification)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "${scores.scores.topLabel} ${(scores.scores.topScore * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp)
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                ClassScoresView(scores.scores)
+            } ?: Text("No scores", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun ViewResultColumn(view: DebugViewResult) {
+    Column(modifier = Modifier.width(148.dp)) {
+        Text(view.label, style = MaterialTheme.typography.labelSmall)
+        Text(
+            "%.0f ms".format(view.timeMs),
+            style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        ScreenshotThumbnail(
+            filePath = view.file.absolutePath,
+            modifier = Modifier.size(140.dp),
+            contentScale = ContentScale.Fit
+        )
+        Text(
+            text = "${view.scores.topLabel} ${(view.scores.topScore * 100).toInt()}%",
+            style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
+            color = severityColor(
+                when (view.scores.topLabel) {
+                    "Hentai", "Pornography" -> ContentSeverity.EXPLICIT
+                    "Enticing or Sensual" -> ContentSeverity.SEXY
+                    else -> ContentSeverity.SAFE
+                }
+            )
+        )
+        Spacer(modifier = Modifier.height(2.dp))
+        ClassScoresView(view.scores, compact = true)
+    }
+}
+
+@Composable
+fun ClassScoresView(scores: ClassScores, compact: Boolean = false) {
+    val fontSize = if (compact) 9.sp else 12.sp
+    val barHeight = if (compact) 5.dp else 8.dp
+    val labelWidth = if (compact) 56.dp else 120.dp
+
+    scores.asLabeledList().forEach { (label, score) ->
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = label,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.width(72.dp)
+                text = if (compact) shortLabel(label) else label,
+                style = MaterialTheme.typography.bodySmall.copy(fontSize = fontSize),
+                modifier = Modifier.width(labelWidth)
             )
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(4.dp))
             LinearProgressIndicator(
                 progress = { score },
-                modifier = Modifier.weight(1f).height(8.dp),
-                color = scoreColor(label, score),
+                modifier = Modifier.weight(1f).height(barHeight),
+                color = classScoreColor(label, score),
                 trackColor = MaterialTheme.colorScheme.surfaceVariant,
             )
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(4.dp))
             Text(
                 text = "${(score * 100).toInt()}%",
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.width(40.dp)
+                style = MaterialTheme.typography.bodySmall.copy(fontSize = fontSize),
+                modifier = Modifier.width(32.dp)
             )
         }
-        Spacer(modifier = Modifier.height(2.dp))
+        Spacer(modifier = Modifier.height(1.dp))
     }
-
-    Spacer(modifier = Modifier.height(4.dp))
-    Text(
-        text = "isNsfw=${scores.isNsfw}",
-        style = MaterialTheme.typography.bodySmall
-    )
 }
 
-fun scoreColor(category: String, score: Float): Color {
-    return when (category) {
-        "safe" -> Color(0xFF4CAF50) // green for safe
-        "nsfw" -> if (score > 0.3f) Color(0xFFF44336) else Color(0xFF9E9E9E) // red when high
-        else -> Color(0xFF9E9E9E)
-    }
+@Composable
+fun NsfwScoresView(scores: NsfwResult) {
+    ClassScoresView(scores.scores)
+}
+
+private fun shortLabel(label: String): String = when (label) {
+    "Anime Picture" -> "Anime"
+    "Hentai" -> "Hentai"
+    "Normal" -> "Normal"
+    "Pornography" -> "Porn"
+    "Enticing or Sensual" -> "Enticing"
+    else -> label
+}
+
+fun severityColor(severity: ContentSeverity): Color = when (severity) {
+    ContentSeverity.EXPLICIT -> Color(0xFFF44336)
+    ContentSeverity.SEXY -> Color(0xFFFF9800)
+    ContentSeverity.SAFE -> Color(0xFF4CAF50)
+}
+
+fun classScoreColor(category: String, score: Float): Color = when (category) {
+    "Normal", "Anime Picture" -> Color(0xFF4CAF50)
+    "Enticing or Sensual" -> if (score > 0.3f) Color(0xFFFF9800) else Color(0xFF9E9E9E)
+    "Hentai", "Pornography" -> if (score > 0.3f) Color(0xFFF44336) else Color(0xFF9E9E9E)
+    else -> Color(0xFF9E9E9E)
 }
 
 @Composable
@@ -194,7 +241,7 @@ fun ScreenshotThumbnail(
     LaunchedEffect(filePath) {
         withContext(Dispatchers.IO) {
             val opts = BitmapFactory.Options().apply {
-                inSampleSize = 4   // thumbnails
+                inSampleSize = 8
             }
             thumbnail = BitmapFactory.decodeFile(filePath, opts)
         }

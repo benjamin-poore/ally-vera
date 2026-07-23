@@ -1,5 +1,6 @@
 package com.allyvera.ui.debug
 
+import com.allyvera.processing.ClassScores
 import com.allyvera.processing.NsfwResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -8,17 +9,23 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 
+/** One inference view: full frame or a strip crop. */
+data class DebugViewResult(
+    val label: String,
+    val file: File,
+    val scores: ClassScores,
+    val timeMs: Double,
+)
+
 data class DebugScreenshotItem(
     val name: String,
-    val file: File,                 // full screenshot
-    val modelInputFile: File,       // the letterboxed 224x224 whole-frame input
+    val file: File,
+    val views: List<DebugViewResult> = emptyList(),
     val scores: NsfwResult? = null,
-    val tiled: Boolean = false,
-    val wholeFrameNsfw: Float = 0f,
-    val tileFiles: List<File> = emptyList(),
-    val tileScores: List<Float> = emptyList(),
+    val modelName: String = "",
+    val accelerator: String = "",
     val totalTimeMs: Double = 0.0,
-    val estimatedBatteryMah: Double = 0.0
+    val estimatedBatteryMah: Double = 0.0,
 )
 
 object DebugManager {

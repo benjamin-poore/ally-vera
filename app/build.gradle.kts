@@ -53,7 +53,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
-    // TensorFlow Lite dependencies for NSFW detection
+    // LiteRT 2.1.5 (monolithic Interpreter); avoid 2.1.6 litert/litert-api namespace clash
     implementation(libs.tensorflow.lite)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
