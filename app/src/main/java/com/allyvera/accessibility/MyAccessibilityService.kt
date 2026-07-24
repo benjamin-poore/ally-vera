@@ -36,14 +36,15 @@ class MyAccessibilityService : AccessibilityService(), CaptureController {
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "Service created")
+        Log.i(TAG, "Service created")
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.d(TAG, "Service connected")
+        Log.i(TAG, "Service connected")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             SensorRegistry.register(this)
+            Log.i(TAG, "Registered as capture sensor (API 34+)")
         } else {
             startLegacyScreenCapture()
         }
@@ -57,7 +58,7 @@ class MyAccessibilityService : AccessibilityService(), CaptureController {
         super.onDestroy()
         SensorRegistry.unregister(this)
         serviceScope.cancel()
-        Log.d(TAG, "Service destroyed")
+        Log.i(TAG, "Service destroyed")
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -75,7 +76,7 @@ class MyAccessibilityService : AccessibilityService(), CaptureController {
 
     /**
      * Sensor work only: acquire a frame, persist it to cache, and emit the path. The bitmap is
-     * recycled once it has been written — the processing layer reads from disk.
+     * recycled once written — the processing layer reads from disk.
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private suspend fun captureFrame() = suspendCancellableCoroutine<Unit> { continuation ->
@@ -100,8 +101,10 @@ class MyAccessibilityService : AccessibilityService(), CaptureController {
                                 )
                                 bitmap.recycle()
                                 if (path != null) {
-                                    // If the bus is full the frame would otherwise leak on disk.
-                                    if (!FrameBus.emit(CapturedFrame(path, FrameSource.ACCESSIBILITY))) {
+                                    if (!FrameBus.emit(
+                                            CapturedFrame(path, FrameSource.ACCESSIBILITY)
+                                        )
+                                    ) {
                                         FrameCache.delete(path)
                                     }
                                 }
@@ -124,10 +127,6 @@ class MyAccessibilityService : AccessibilityService(), CaptureController {
         }
     }
 
-    /**
-     * Converts a HardwareBuffer to a software Bitmap (ARGB_8888). HARDWARE configs cannot be
-     * read with getPixels() for TFLite prep, so the processing layer expects a software bitmap.
-     */
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun HardwareBuffer.toBitmap(): Bitmap? {
         return try {

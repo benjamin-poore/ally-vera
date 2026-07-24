@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Rect
 import android.os.SystemClock
 import android.util.Log
 import com.allyvera.frame.FrameCache
@@ -25,9 +26,10 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 
 /**
- * SigLIP2-x256 over full frame + center square + 3 overlapping strips (30%).
- *
- * Runs model_dynamic_range.tflite on CPU/XNNPack via Interpreter.
+ * Cascade:
+ * 1) EfficientDet-Lite0 finds image-like regions on the screenshot (cheap, 320²).
+ * 2) Each region is cropped, letterboxed to 256², and classified with SigLIP2.
+ * No strip / 3×3 path — only detector crops (full-frame letterbox if none found).
  */
 object ScreenshotProcessor {
 
@@ -37,16 +39,22 @@ object ScreenshotProcessor {
     private const val MODEL_DISPLAY_NAME = "Int8"
     private const val ACCELERATOR = "CPU/XNNPack"
     private const val MODEL_SIZE = 256
+    private const val TOP_OFFSET_PX = 100
+    private const val BOTTOM_OFFSET_PX = 130
     private const val NUM_CLASSES = 5
-    private const val STRIP_COUNT = 3
-    private const val STRIP_OVERLAP = 0.30f
-    private const val DEBUG_JPEG_QUALITY = 40
+    private const val DEBUG_JPEG_QUALITY = 35
     private const val CPU_CURRENT_A = 0.5
     private const val INPUT_FLOATS = MODEL_SIZE * MODEL_SIZE * 3
+    private const val NUM_THREADS = 6
 
     private var interpreter: Interpreter? = null
     @Volatile private var loadedAccelerator: String = "—"
     private val engineMutex = Mutex()
+
+    private val pixelScratch = IntArray(MODEL_SIZE * MODEL_SIZE)
+    private val inputBuffer: ByteBuffer =
+        ByteBuffer.allocateDirect(INPUT_FLOATS * 4).order(ByteOrder.nativeOrder())
+    private val outputScratch = Array(1) { FloatArray(NUM_CLASSES) }
 
     val currentAccelerator: String get() = loadedAccelerator
 
@@ -55,11 +63,14 @@ object ScreenshotProcessor {
         return engineMutex.withLock {
             interpreter?.let { return@withLock it }
             val buffer = loadModelFile(context, MODEL_FILENAME)
-            val options = Interpreter.Options().apply { setNumThreads(4) }
+            val options = Interpreter.Options().apply {
+                setNumThreads(NUM_THREADS)
+                setUseXNNPACK(true)
+            }
             val created = Interpreter(buffer, options)
             interpreter = created
             loadedAccelerator = ACCELERATOR
-            Log.i(TAG, "Engine ready: file=$MODEL_FILENAME accelerator=$ACCELERATOR")
+            Log.i(TAG, "Engine ready: file=$MODEL_FILENAME accelerator=$ACCELERATOR threads=$NUM_THREADS")
             created
         }
     }
@@ -88,6 +99,7 @@ object ScreenshotProcessor {
                 loadedAccelerator = "—"
             }
         }
+        ImageRegionDetector.release()
     }
 
     suspend fun reloadModel() = engineMutex.withLock {
@@ -95,19 +107,11 @@ object ScreenshotProcessor {
         loadedAccelerator = "—"
     }
 
-    private suspend fun inferScores(modelInput: Bitmap, interp: Interpreter): ClassScores =
-        withContext(Dispatchers.Default) {
-            engineMutex.withLock {
-                val input = bitmapToFloatBuffer(modelInput)
-                val output = Array(1) { FloatArray(NUM_CLASSES) }
-                interp.run(input, output)
-                ClassScores.fromLogits(output[0])
-            }
-        }
-
-    // ------------------------------------------------------------------
-    // Preprocessing
-    // ------------------------------------------------------------------
+    private fun inferScoresLocked(modelInput: Bitmap, interp: Interpreter): ClassScores {
+        fillInputBuffer(modelInput)
+        interp.run(inputBuffer, outputScratch)
+        return ClassScores.fromLogits(outputScratch[0])
+    }
 
     private fun letterboxToSquare(bitmap: Bitmap, size: Int = MODEL_SIZE): Bitmap {
         val w = bitmap.width
@@ -128,76 +132,37 @@ object ScreenshotProcessor {
         return square
     }
 
-    private fun cropCenterSquare(bitmap: Bitmap): Bitmap {
-        val w = bitmap.width
-        val h = bitmap.height
-        val side = minOf(w, h)
-        val x = ((w - side) / 2).coerceAtLeast(0)
-        val y = ((h - side) / 2).coerceAtLeast(0)
-        return Bitmap.createBitmap(bitmap, x, y, side, side)
+    /** Content area with system bars removed. */
+    private fun contentCrop(bitmap: Bitmap): Bitmap {
+        val topOffset = TOP_OFFSET_PX.coerceAtMost(bitmap.height / 4)
+        val bottomOffset = BOTTOM_OFFSET_PX.coerceAtMost(bitmap.height / 4)
+        val top = topOffset
+        val bottom = (bitmap.height - bottomOffset).coerceAtLeast(top + 1)
+        return Bitmap.createBitmap(bitmap, 0, top, bitmap.width, bottom - top)
     }
 
-    private fun cropStrips(bitmap: Bitmap): List<Pair<String, Bitmap>> {
-        val w = bitmap.width
-        val h = bitmap.height
-        val landscape = w > h
-        val dim = if (landscape) w else h
-        val denom = STRIP_COUNT - (STRIP_COUNT - 1) * STRIP_OVERLAP
-        val stripLen = (dim / denom).toInt().coerceIn(1, dim)
-        val step = ((1f - STRIP_OVERLAP) * stripLen).toInt().coerceAtLeast(1)
-        val starts = listOf(0, step, (dim - stripLen).coerceAtLeast(step))
-        val labels = if (landscape) {
-            listOf("Left", "Center", "Right")
-        } else {
-            listOf("Top", "Center", "Bottom")
-        }
-        return starts.mapIndexed { index, start ->
-            val length = minOf(stripLen, dim - start)
-            val patch = if (landscape) {
-                Bitmap.createBitmap(bitmap, start, 0, length, h)
-            } else {
-                Bitmap.createBitmap(bitmap, 0, start, w, length)
-            }
-            labels[index] to patch
-        }
+    private fun cropToBounds(bitmap: Bitmap, bounds: Rect): Bitmap? {
+        val frame = Rect(0, 0, bitmap.width, bitmap.height)
+        val clipped = Rect(bounds)
+        if (!clipped.intersect(frame)) return null
+        if (clipped.width() <= 0 || clipped.height() <= 0) return null
+        return Bitmap.createBitmap(bitmap, clipped.left, clipped.top, clipped.width(), clipped.height())
     }
 
-    private suspend fun runView(
-        label: String,
-        modelInput: Bitmap,
-        outFile: File,
-        interp: Interpreter,
-        views: MutableList<DebugViewResult>,
-    ): ClassScores {
-        saveJpeg(modelInput, outFile)
-        val t0 = SystemClock.elapsedRealtimeNanos()
-        val scores = inferScores(modelInput, interp)
-        val ms = (SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000.0
-        views.add(DebugViewResult(label, outFile, scores, ms))
-        return scores
-    }
-
-    private fun fillFloatArray(bitmap: Bitmap, out: FloatArray) {
-        val pixels = IntArray(MODEL_SIZE * MODEL_SIZE)
-        bitmap.getPixels(pixels, 0, MODEL_SIZE, 0, 0, MODEL_SIZE, MODEL_SIZE)
+    private fun fillInputBuffer(bitmap: Bitmap) {
+        bitmap.getPixels(pixelScratch, 0, MODEL_SIZE, 0, 0, MODEL_SIZE, MODEL_SIZE)
+        inputBuffer.rewind()
+        val floats = inputBuffer.asFloatBuffer()
         var i = 0
-        for (pixel in pixels) {
+        for (pixel in pixelScratch) {
             val r = ((pixel shr 16) and 0xFF) / 255f
             val g = ((pixel shr 8) and 0xFF) / 255f
             val b = (pixel and 0xFF) / 255f
-            out[i++] = (r - 0.5f) / 0.5f
-            out[i++] = (g - 0.5f) / 0.5f
-            out[i++] = (b - 0.5f) / 0.5f
+            floats.put(i++, (r - 0.5f) / 0.5f)
+            floats.put(i++, (g - 0.5f) / 0.5f)
+            floats.put(i++, (b - 0.5f) / 0.5f)
         }
-    }
-
-    private fun bitmapToFloatBuffer(bitmap: Bitmap): ByteBuffer {
-        val floats = FloatArray(INPUT_FLOATS)
-        fillFloatArray(bitmap, floats)
-        return ByteBuffer.allocateDirect(INPUT_FLOATS * 4).order(ByteOrder.nativeOrder()).apply {
-            asFloatBuffer().put(floats)
-            rewind()
-        }
+        inputBuffer.rewind()
     }
 
     private fun ensureSoftwareBitmap(bitmap: Bitmap): Bitmap {
@@ -212,12 +177,8 @@ object ScreenshotProcessor {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Main processing
-    // ------------------------------------------------------------------
-
     suspend fun process(context: Context, framePath: String) {
-        withContext(Dispatchers.IO) {
+        withContext(Dispatchers.Default) {
             val bitmap = BitmapFactory.decodeFile(framePath)
             if (bitmap == null) {
                 Log.e(TAG, "Unable to decode cached frame $framePath")
@@ -243,35 +204,63 @@ object ScreenshotProcessor {
         if (!tileDir.exists()) tileDir.mkdirs()
 
         val software = ensureSoftwareBitmap(bitmap)
-        saveJpeg(software, file)
+        val content = contentCrop(software)
 
         val interp = ensureInterpreter(context)
         val accelerator = loadedAccelerator
         val totalStartNanos = SystemClock.elapsedRealtimeNanos()
 
-        val views = mutableListOf<DebugViewResult>()
-        var aggregate = ClassScores()
+        val detectStart = SystemClock.elapsedRealtimeNanos()
+        val regions = ImageRegionDetector.detect(context, content)
+        val detectMs = (SystemClock.elapsedRealtimeNanos() - detectStart) / 1_000_000.0
 
-        val wholeLetterboxed = letterboxToSquare(software)
-        aggregate = runView("Full", wholeLetterboxed, File(tileDir, "full.jpg"), interp, views)
-        if (wholeLetterboxed !== software) wholeLetterboxed.recycle()
-
-        val centerSq = cropCenterSquare(software)
-        val centerLetterboxed = letterboxToSquare(centerSq)
-        if (centerLetterboxed !== centerSq) centerSq.recycle()
-        aggregate = aggregate.maxWith(
-            runView("Square", centerLetterboxed, File(tileDir, "center_square.jpg"), interp, views)
+        data class CellResult(
+            val label: String,
+            val cell: Bitmap,
+            val scores: ClassScores,
+            val timeMs: Double,
+            val outFile: File,
         )
-        centerLetterboxed.recycle()
 
-        cropStrips(software).forEachIndexed { index, (label, patch) ->
-            val letterboxed = letterboxToSquare(patch)
-            patch.recycle()
-            aggregate = aggregate.maxWith(
-                runView(label, letterboxed, File(tileDir, "strip_$index.jpg"), interp, views)
-            )
-            letterboxed.recycle()
+        val viewsToRun = ArrayList<Pair<String, Bitmap>>()
+        if (regions.isEmpty()) {
+            Log.i(TAG, "No detector regions — full-frame letterbox fallback")
+            viewsToRun.add("Full" to letterboxToSquare(content))
+        } else {
+            regions.forEachIndexed { index, bounds ->
+                val crop = cropToBounds(content, bounds) ?: return@forEachIndexed
+                val letterboxed = letterboxToSquare(crop)
+                crop.recycle()
+                viewsToRun.add("R$index" to letterboxed)
+            }
         }
+        content.recycle()
+
+        val cellResults = ArrayList<CellResult>(viewsToRun.size)
+        var aggregate = ClassScores()
+        var inferMsTotal = 0.0
+
+        engineMutex.withLock {
+            viewsToRun.forEachIndexed { index, (label, cell) ->
+                val t0 = SystemClock.elapsedRealtimeNanos()
+                val scores = inferScoresLocked(cell, interp)
+                val ms = (SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000.0
+                inferMsTotal += ms
+                aggregate = aggregate.maxWith(scores)
+                cellResults.add(
+                    CellResult(label, cell, scores, ms, File(tileDir, "view_$index.jpg"))
+                )
+            }
+        }
+
+        val ioStart = SystemClock.elapsedRealtimeNanos()
+        saveJpeg(software, file)
+        val views = cellResults.map { cell ->
+            saveJpeg(cell.cell, cell.outFile)
+            cell.cell.recycle()
+            DebugViewResult(cell.label, cell.outFile, cell.scores, cell.timeMs)
+        }
+        val ioMs = (SystemClock.elapsedRealtimeNanos() - ioStart) / 1_000_000.0
 
         val totalDurationMs = (SystemClock.elapsedRealtimeNanos() - totalStartNanos) / 1_000_000.0
         val estimatedBatteryMah = (CPU_CURRENT_A * totalDurationMs) / 3600.0
@@ -280,7 +269,9 @@ object ScreenshotProcessor {
         Log.i(TAG, "🔬 Inference stats for $filename ($MODEL_DISPLAY_NAME / $accelerator)")
         Log.i(
             TAG,
-            "   Source: ${software.width}x${software.height} -> full + center-square + 3 strips @${(STRIP_OVERLAP * 100).toInt()}% overlap"
+            "   Source: ${software.width}x${software.height} -> detect=${regions.size} region(s) " +
+                "detect=${"%.0f".format(detectMs)}ms infer=${"%.0f".format(inferMsTotal)}ms " +
+                "io=${"%.0f".format(ioMs)}ms total=${"%.0f".format(totalDurationMs)}ms"
         )
         views.forEach { v ->
             Log.i(
@@ -292,7 +283,7 @@ object ScreenshotProcessor {
             TAG,
             "   Aggregate top=${aggregate.topLabel} ${"%.3f".format(aggregate.topScore)}  (${result.classification})"
         )
-        Log.i(TAG, "   Total time: %.1f ms  ~%.3f mAh".format(totalDurationMs, estimatedBatteryMah))
+        Log.i(TAG, "   ~%.3f mAh".format(estimatedBatteryMah))
 
         if (software !== bitmap) software.recycle()
         bitmap.recycle()

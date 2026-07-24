@@ -9,5 +9,5 @@ enum class FrameSource { ACCESSIBILITY, MEDIA_PROJECTION }
  */
 data class CapturedFrame(
     val path: String,
-    val source: FrameSource
+    val source: FrameSource,
 )

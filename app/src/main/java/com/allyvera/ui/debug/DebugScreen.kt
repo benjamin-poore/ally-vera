@@ -103,7 +103,7 @@ private fun ScreenshotCard(item: DebugScreenshotItem) {
             if (item.views.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "Views (full + center square + strips)",
+                    "Views (detector regions)",
                     style = MaterialTheme.typography.labelMedium
                 )
                 Spacer(modifier = Modifier.height(4.dp))

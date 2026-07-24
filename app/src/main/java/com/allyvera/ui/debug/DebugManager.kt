@@ -9,7 +9,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 
-/** One inference view: full frame or a strip crop. */
+/** One inference view: a detector crop (or full-frame fallback). */
 data class DebugViewResult(
     val label: String,
     val file: File,

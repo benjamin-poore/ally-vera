@@ -25,7 +25,7 @@ data class ClassScores(
     val topScore: Float
         get() = asLabeledList().maxBy { it.second }.second
 
-    /** Max across corresponding classes (for strip aggregation). */
+    /** Max across corresponding classes (for multi-view aggregation). */
     fun maxWith(other: ClassScores): ClassScores = ClassScores(
         animePicture = maxOf(animePicture, other.animePicture),
         hentai = maxOf(hentai, other.hentai),
